@@ -1,0 +1,116 @@
+- name: 'APT34 - HOLLOW CROWN: AdminSDHolder Poisoning via WriteDACL for Persistent Domain Compromise (DC03)'
+  description: >-
+    Represents the final privilege escalation and persistence stage in which
+    svc_itadmin's WriteDACL permission on the AdminSDHolder container is exploited
+    to achieve persistent domain administrative access. The operator writes a
+    GenericAll ACE for svc_itadmin on AdminSDHolder. The Security Descriptor
+    Propagator (SDProp) process, running every 2 minutes in the lab environment,
+    propagates this ACE to all protected groups including Domain Admins, Account
+    Operators, and Server Operators. Once propagated, the operator adds svc_itadmin
+    to Domain Admins and performs DCSync to extract all domain credentials. The
+    persistence aspect is critical — even if a defender removes svc_itadmin from
+    Domain Admins, SDProp will re-propagate the GenericAll permission from
+    AdminSDHolder on its next cycle, allowing the operator to re-add themselves.
+    The defender must identify and remove the ACE on AdminSDHolder itself to break
+    the persistence chain.
+  tactic: privilege-escalation
+  technique_id: T1098
+  technique_name: Account Manipulation
+  singleton: false
+  repeatable: false
+  delete_payload: false
+  executors:
+  - name: psh
+    platform: windows
+    command: |-
+      $ErrorActionPreference = "SilentlyContinue"
+
+      Write-Host "[*] Scenario 4 preflight: AdminSDHolder poisoning path validation" -ForegroundColor Cyan
+
+      Write-Host "`n[*] Checking AdminSDHolder container ACL" -ForegroundColor Yellow
+      $asdh = "CN=AdminSDHolder,CN=System,DC=cyberange,DC=local"
+      try {
+        $acl = Get-Acl "AD:\$asdh" -ErrorAction SilentlyContinue
+        if ($acl) {
+          $svcItadminACE = $acl.Access | Where-Object { $_.IdentityReference -like "*svc_itadmin*" }
+          if ($svcItadminACE) {
+            Write-Host "[+] svc_itadmin ACE found on AdminSDHolder:"
+            $svcItadminACE | Select-Object IdentityReference, ActiveDirectoryRights | Format-Table -AutoSize | Out-String | Write-Host
+          } else {
+            Write-Host "[*] No existing svc_itadmin ACE on AdminSDHolder (expected pre-attack state)"
+          }
+        }
+      } catch {
+        Write-Host "[*] AD module not available, skipping ACL check"
+      }
+
+      Write-Host "`n[*] Checking SDProp accelerator task" -ForegroundColor Yellow
+      Get-ScheduledTask -TaskName "SDProp-Force" -ErrorAction SilentlyContinue |
+        Select-Object TaskName, State |
+        Format-Table -AutoSize | Out-String | Write-Host
+
+      Write-Host "`n[*] Checking Domain Admins membership" -ForegroundColor Yellow
+      try {
+        Get-ADGroupMember "Domain Admins" -ErrorAction SilentlyContinue |
+          Select-Object Name, SamAccountName |
+          Format-Table -AutoSize | Out-String | Write-Host
+      } catch {
+        Write-Host "[*] AD module not available, skipping group check"
+      }
+
+      Write-Host "`n[*] Checking DC connectivity" -ForegroundColor Yellow
+      if (Test-NetConnection DC03.cyberange.local -Port 389 -InformationLevel Quiet -ErrorAction SilentlyContinue) {
+        Write-Host "[+] LDAP (389) reachable on DC03"
+      }
+      if (Test-NetConnection DC03.cyberange.local -Port 88 -InformationLevel Quiet -ErrorAction SilentlyContinue) {
+        Write-Host "[+] Kerberos (88) reachable on DC03"
+      }
+
+      Write-Host "`n[*] Simulation complete (no ACE written, no group membership modified, no DCSync)" -ForegroundColor Cyan
+    code: null
+    language: null
+    build_target: null
+    payloads: []
+    uploads: []
+    timeout: 300
+    parsers: []
+    cleanup: []
+    variations: []
+    additional_info:
+      target_host: DC03.cyberange.local
+      domain: cyberange.local
+      compromised_account:
+        username: svc_itadmin
+        password: '1tAdm!nSvc#2025'
+        acl_on_adminsdholder: WriteDACL
+      adminsdholder:
+        dn: 'CN=AdminSDHolder,CN=System,DC=cyberange,DC=local'
+        ace_written: GenericAll for svc_itadmin
+        propagation_mechanism: SDProp (Security Descriptor Propagator)
+        propagation_interval: 120 seconds (lab accelerated via scheduled task)
+      protected_groups_affected:
+        - Domain Admins
+        - Account Operators
+        - Server Operators
+        - Backup Operators
+        - Enterprise Admins
+      attack_steps:
+        step1: 'Write GenericAll ACE on AdminSDHolder using bloodyAD or dacledit'
+        step2: 'Wait for SDProp propagation (2 minutes in lab)'
+        step3: 'Add svc_itadmin to Domain Admins via net rpc group addmem'
+        step4: 'DCSync using impacket-secretsdump'
+      persistence_note: >-
+        Removing svc_itadmin from Domain Admins does NOT break persistence.
+        SDProp re-propagates the GenericAll ACE from AdminSDHolder on every cycle.
+        Defender must clean the ACE on AdminSDHolder itself.
+      outcome: Full domain compromise — all NTDS.dit credentials extracted
+      contingencies:
+        C5a: 'svc_itadmin WriteProperty on Backup Operators — add self, backup SAM/SYSTEM hives'
+        C5b: 'Writable GPO DC-HealthCheck-Policy — deploy scheduled task via GPO for DA'
+      detection_events:
+        - '5136 on DC03 — AdminSDHolder nTSecurityDescriptor modified'
+        - '4728 on DC03 — svc_itadmin added to Domain Admins'
+        - '4662 on DC03 — Directory service replication (DCSync)'
+        - 'Periodic audit of AdminSDHolder ACL for unauthorized entries'
+  requirements: []
+  id: e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0
