@@ -1,0 +1,99 @@
+- name: 'APT34 - HOLLOW CROWN: SQL EXECUTE AS Impersonation and Agent Job Execution (SRV09-SQL)'
+  description: >-
+    Models lateral movement and privilege escalation within the SQL tier by
+    exploiting an IMPERSONATE privilege granted to svc_ldap on the sa login.
+    After connecting to MSSQL on SRV09-SQL with Windows authentication, the
+    operator escalates to sa context via EXECUTE AS LOGIN, enables xp_cmdshell,
+    and creates a SQL Agent job using the CmdExec subsystem. The SQL Agent
+    service runs as svc_dev, so CmdExec job steps execute operating system
+    commands in the security context of cyberange\svc_dev. This technique is
+    commonly observed in enterprise intrusions where database services are
+    used as pivot points for lateral movement. Key detection opportunities
+    include SQL audit logs for EXECUTE AS and sp_add_job calls, Event 4688
+    on SRV09-SQL for cmd.exe spawned by sqlservr.exe, and network connections
+    from the SQL host to attacker infrastructure.
+  tactic: privilege-escalation
+  technique_id: T1078.002
+  technique_name: 'Valid Accounts: Domain Accounts'
+  singleton: false
+  repeatable: false
+  delete_payload: false
+  executors:
+  - name: psh
+    platform: windows
+    command: |-
+      echo "[*] Scenario 4 preflight: SQL impersonation path validation"
+      echo "[*] Compromised account: svc_ldap"
+      echo "[*] Target: MSSQL on SRV09-SQL (port 1433)"
+      echo "[*] Impersonation target: sa"
+      echo "[*] SQL Agent service account: svc_dev"
+      echo
+
+      for host in SRV09-SQL.cyberange.local DC03.cyberange.local; do
+        echo "[*] Resolving $host"
+        getent hosts "$host" 2>/dev/null || nslookup "$host" 2>/dev/null || echo "[!] DNS lookup failed for $host"
+        echo
+      done
+
+      if command -v nc >/dev/null 2>&1; then
+        echo "[*] Port checks"
+        nc -zvw3 SRV09-SQL.cyberange.local 1433 2>&1 || true
+        nc -zvw3 SRV09-SQL.cyberange.local 445 2>&1 || true
+        nc -zvw3 SRV09-SQL.cyberange.local 5985 2>&1 || true
+      else
+        echo "[*] nc not present, using ping as fallback"
+        ping -c 1 SRV09-SQL.cyberange.local 2>/dev/null || true
+      fi
+
+      echo
+      echo "[*] Expected SQL escalation chain:"
+      echo "    1. Connect as svc_ldap (Windows auth)"
+      echo "    2. EXECUTE AS LOGIN = 'sa'"
+      echo "    3. Enable xp_cmdshell"
+      echo "    4. Create SQL Agent job (CmdExec subsystem)"
+      echo "    5. Job executes as cyberange\\svc_dev"
+
+      echo
+      echo "[*] Simulation complete (no SQL connections, no impersonation attempted)"
+    code: null
+    language: null
+    build_target: null
+    payloads: []
+    uploads: []
+    timeout: 180
+    parsers: []
+    cleanup: []
+    variations: []
+    additional_info:
+      target_host: SRV09-SQL.cyberange.local
+      dc_host: DC03.cyberange.local
+      domain: cyberange.local
+      compromised_account:
+        username: svc_ldap
+        password: 'Ld@pB1nd#2025!'
+        sql_login_type: Windows Authentication
+        sql_privilege: IMPERSONATE on sa
+      impersonation_target:
+        login: sa
+        effective_role: sysadmin
+      sql_agent:
+        service_account: 'CYBERANGE\svc_dev'
+        subsystem: CmdExec
+        command_prefix: 'cmd /c'
+        execution_context: svc_dev domain account
+      extracted_account:
+        username: svc_dev
+        password: 'D3v$3rv!c3#2025'
+        permissions: WinRM access to SRV10-DEV
+      contingencies:
+        C2a: 'TRUSTWORTHY database + db_owner — EXECUTE AS USER dbo → xp_cmdshell'
+        C2b: 'OLE Automation — sp_OACreate WScript.Shell → Run'
+        C2c: 'CLR Assembly — sp_clr_exec stored procedure'
+        SKIP_B: 'ServiceCredentials table in DevAppDB — svc_itadmin cleartext (skip to Step 5)'
+      detection_events:
+        - '4624 on SRV09-SQL — Windows auth for svc_ldap'
+        - 'SQL Audit — EXECUTE AS LOGIN sa'
+        - 'SQL Audit — sp_add_job / sp_start_job calls'
+        - '4688 on SRV09-SQL — cmd.exe spawned by sqlservr.exe as svc_dev'
+  requirements: []
+  id: b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7
