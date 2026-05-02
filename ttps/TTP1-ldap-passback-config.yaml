@@ -1,0 +1,87 @@
+- name: 'APT34 - HOLLOW CROWN: LDAP Passback Credential Capture via Web Admin Portal (SRV08-WEB)'
+  description: >-
+    Represents initial credential acquisition through abuse of a misconfigured
+    LDAP management portal on SRV08-WEB. The web application uses default
+    credentials (admin:admin) and exposes an LDAP configuration page that performs
+    Simple Bind (AuthType.Basic) against whatever server is specified. By
+    redirecting the LDAP server field to an attacker-controlled listener, the
+    operator captures the bind credentials of svc_ldap in cleartext. This mirrors
+    a common attack pattern against enterprise management portals that store and
+    test LDAP connections without enforcing TLS or SASL authentication. Defensive
+    telemetry would include outbound LDAP connections from SRV08-WEB to non-DC
+    addresses, IIS access logs showing /admin endpoint usage, and Event 4624 for
+    svc_ldap from unexpected sources.
+  tactic: credential-access
+  technique_id: T1190
+  technique_name: Exploit Public-Facing Application
+  singleton: false
+  repeatable: true
+  delete_payload: false
+  executors:
+  - name: psh
+    platform: windows
+    command: |-
+      echo "[*] Scenario 4 preflight: LDAP passback path validation"
+      echo "[*] Target web portal: http://SRV08-WEB/admin/"
+      echo "[*] Default portal credentials: admin:admin"
+      echo "[*] LDAP bind account of interest: svc_ldap"
+      echo
+
+      for host in SRV08-WEB.cyberange.local DC03.cyberange.local; do
+        echo "[*] Resolving $host"
+        getent hosts "$host" 2>/dev/null || nslookup "$host" 2>/dev/null || echo "[!] DNS lookup failed for $host"
+        echo
+      done
+
+      if command -v nc >/dev/null 2>&1; then
+        echo "[*] Port checks"
+        nc -zvw3 SRV08-WEB.cyberange.local 80 2>&1 || true
+        nc -zvw3 SRV08-WEB.cyberange.local 445 2>&1 || true
+        nc -zvw3 DC03.cyberange.local 389 2>&1 || true
+        nc -zvw3 DC03.cyberange.local 88 2>&1 || true
+      else
+        echo "[*] nc not present, using ping as fallback"
+        ping -c 1 SRV08-WEB.cyberange.local 2>/dev/null || true
+        ping -c 1 DC03.cyberange.local 2>/dev/null || true
+      fi
+
+      echo
+      echo "[*] Checking IIS service state"
+      sc query W3SVC 2>/dev/null || echo "[*] IIS query skipped (not local)"
+
+      echo
+      echo "[*] Simulation complete (no LDAP bind intercepted, no credentials captured)"
+    code: null
+    language: null
+    build_target: null
+    payloads: []
+    uploads: []
+    timeout: 180
+    parsers: []
+    cleanup: []
+    variations: []
+    additional_info:
+      target_host: SRV08-WEB.cyberange.local
+      dc_host: DC03.cyberange.local
+      domain: cyberange.local
+      web_portal:
+        url: 'http://SRV08-WEB/admin/'
+        default_creds: 'admin:admin'
+        ldap_config_page: 'LDAP Configuration — Test Connection button'
+        auth_type: 'AuthType.Basic (Simple Bind — cleartext)'
+      captured_account:
+        username: svc_ldap
+        password: 'Ld@pB1nd#2025!'
+        description: LDAP bind service account used by web portal
+        domain_permissions: MSSQL login on SRV09-SQL with IMPERSONATE on sa
+      contingencies:
+        C1a: 'web.config.bak in IIS wwwroot — svc_ldap creds in connectionString'
+        C1b: '/docs/infrastructure.html — LDAP connection details'
+        C1c: 'WebBackups$ hidden share — IIS export with creds'
+        SKIP_A: 'svc_ldap has ForceChangePassword on svc_build — skip Steps 2+3'
+      detection_events:
+        - '4624 on DC03 — Logon for svc_ldap from unexpected IP'
+        - 'IIS W3C log — POST to /admin/ from attacker IP'
+        - 'Outbound LDAP (389/TCP) from SRV08-WEB to non-DC address'
+  requirements: []
+  id: a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6
