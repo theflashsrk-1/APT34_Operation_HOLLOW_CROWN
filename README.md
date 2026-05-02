@@ -1,9 +1,9 @@
 # APT34 Operation HOLLOW CROWN — Active Directory LDAP & Service Exploitation Cyber Range
 
-**Classification:** UNCLASSIFIED // EXERCISE ONLY
-**Domain Theme:** Corporate Enterprise — Technology Services AD Infrastructure
-**Network:** cyberange.local
-**Platform:** Windows Server 2019 — OpenStack / QEMU-KVM
+**Classification:** UNCLASSIFIED // EXERCISE ONLY\
+**Domain Theme:** Corporate Enterprise — Technology Services AD Infrastructure\
+**Network:** cyberange.local\
+**Platform:** Windows Server 2019
 
 ---
 
@@ -194,19 +194,6 @@ impacket-secretsdump 'CYBERANGE/svc_itadmin:1tAdm!nSvc#2025@DC03'
 5. M5-SRV11-JUMP — Join domain, install LAPS client, cache DPAPI creds
 6. M1-DC03 (again) — Post-join: LAPS GPO, AdminSDHolder ACL, SPNs
 ```
-
----
-
-## OpenStack Network Assignment
-
-| Machine | Network | Key Ports |
-|---------|---------|-----------|
-| DC03 | lab-net | 53, 88, 135, 389, 636, 445, 5985 |
-| SRV08-WEB | lab-net | 80 (IIS), 445 |
-| SRV09-SQL | lab-net | 1433 (MSSQL), 445 |
-| SRV10-DEV | lab-net | 445, 5985 (WinRM) |
-| SRV11-JUMP | lab-net | 445, 3389 (RDP), 5985 |
-
 ---
 
 ## APT34 Technique Mapping
