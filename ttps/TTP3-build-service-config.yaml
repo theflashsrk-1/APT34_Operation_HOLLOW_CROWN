@@ -1,0 +1,106 @@
+- name: 'APT34 - HOLLOW CROWN: NSSM Service Script Hijack for LAPS Password Extraction (SRV10-DEV)'
+  description: >-
+    Models privilege escalation on the build server by exploiting a writable
+    service script associated with CorpBuildSvc, an NSSM-wrapped PowerShell
+    service running as svc_build. The operator connects to SRV10-DEV via WinRM
+    as svc_dev and identifies that the service script
+    (C:\BuildService\BuildMonitor.ps1) is writable. By replacing the script
+    content with attacker-controlled commands and restarting the service, code
+    execution is achieved as svc_build. This account is a member of the BuildOps
+    group which has ReadLAPSPassword delegation on the Servers OU, enabling
+    extraction of the LAPS-managed local administrator password for SRV11-JUMP.
+    Detection opportunities include file modification monitoring on service
+    scripts, Event 7036 for CorpBuildSvc state changes, and LDAP queries for
+    the ms-Mcs-AdmPwd attribute.
+  tactic: persistence
+  technique_id: T1574.011
+  technique_name: 'Hijack Execution Flow: Services File Permissions Weakness'
+  singleton: false
+  repeatable: false
+  delete_payload: false
+  executors:
+  - name: psh
+    platform: windows
+    command: |-
+      $ErrorActionPreference = "SilentlyContinue"
+
+      Write-Host "[*] Scenario 4 preflight: service hijack path validation" -ForegroundColor Cyan
+
+      Write-Host "`n[*] Checking CorpBuildSvc service configuration" -ForegroundColor Yellow
+      Get-Service -Name "CorpBuildSvc" -ErrorAction SilentlyContinue |
+        Select-Object Name, Status, StartType |
+        Format-Table -AutoSize | Out-String | Write-Host
+
+      Write-Host "[*] Checking service script permissions" -ForegroundColor Yellow
+      if (Test-Path "C:\BuildService\BuildMonitor.ps1") {
+        icacls "C:\BuildService\BuildMonitor.ps1" 2>$null | Out-String | Write-Host
+      } else {
+        Write-Host "[!] BuildMonitor.ps1 not found at expected path"
+      }
+
+      Write-Host "`n[*] Checking NSSM installation" -ForegroundColor Yellow
+      if (Test-Path "C:\Tools\nssm.exe") {
+        Write-Host "[+] NSSM found at C:\Tools\nssm.exe"
+      } else {
+        Write-Host "[*] NSSM not at default path, checking service registry"
+      }
+
+      Write-Host "`n[*] Checking WinRM listener state" -ForegroundColor Yellow
+      Get-Service WinRM -ErrorAction SilentlyContinue |
+        Select-Object Name, Status, StartType |
+        Format-Table -AutoSize | Out-String | Write-Host
+
+      Write-Host "`n[*] Checking LAPS schema presence" -ForegroundColor Yellow
+      $searcher = New-Object DirectoryServices.DirectorySearcher
+      $searcher.Filter = "(cn=ms-Mcs-AdmPwd)"
+      $result = $searcher.FindOne()
+      if ($result) {
+        Write-Host "[+] LAPS schema attribute ms-Mcs-AdmPwd found in AD"
+      } else {
+        Write-Host "[!] LAPS schema not detected"
+      }
+
+      Write-Host "`n[*] Simulation complete (no script modified, no service restarted)" -ForegroundColor Cyan
+    code: null
+    language: null
+    build_target: null
+    payloads: []
+    uploads: []
+    timeout: 180
+    parsers: []
+    cleanup: []
+    variations: []
+    additional_info:
+      target_host: SRV10-DEV.cyberange.local
+      dc_host: DC03.cyberange.local
+      domain: cyberange.local
+      access_method: WinRM (port 5985) as svc_dev
+      compromised_account:
+        username: svc_dev
+        password: 'D3v$3rv!c3#2025'
+        access: WinRM to SRV10-DEV
+      target_service:
+        name: CorpBuildSvc
+        wrapper: NSSM
+        script_path: 'C:\BuildService\BuildMonitor.ps1'
+        runs_as: 'CYBERANGE\svc_build'
+        script_writable_by: svc_dev
+      escalated_account:
+        username: svc_build
+        password: 'Bu1ld@cc#2025!'
+        group_membership: BuildOps
+        laps_permission: ReadLAPSPassword on OU=Servers
+      laps_target:
+        computer: SRV11-JUMP
+        attribute: ms-Mcs-AdmPwd
+      contingencies:
+        C3a: 'Unquoted service path CorpDevTools — writable intermediate directory'
+        C3b: 'NightlyBuildClean scheduled task — writable folder, runs as svc_build'
+        C3c: 'AlwaysInstallElevated — HKLM + HKCU both set to 1'
+      detection_events:
+        - '4624 on SRV10-DEV — WinRM logon for svc_dev'
+        - 'File modification audit on C:\BuildService\BuildMonitor.ps1'
+        - '7036 on SRV10-DEV — CorpBuildSvc service state change'
+        - 'LDAP query for ms-Mcs-AdmPwd attribute from SRV10-DEV'
+  requirements: []
+  id: c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8
