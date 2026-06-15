@@ -7,7 +7,7 @@
 |---|---|
 | **Environment** | 5 × Windows Server 2019 |
 | **Domain** | cyberange.local / CYBERANGE |
-| **Emulated Actor** | APT34 (OilRig / Helix Kitten / Cobalt Gypsy) |
+| **Actor** | APT34 (OilRig / Helix Kitten / Cobalt Gypsy) |
 | **Attack Chain** | LDAP Passback → SQL Impersonation → Service Hijack → LAPS + DPAPI → AdminSDHolder → DCSync |
 | **End Goal** | Full Domain Compromise — DCSync of cyberange.local |
 
